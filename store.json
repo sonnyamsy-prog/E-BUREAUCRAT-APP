@@ -1,0 +1,97 @@
+{
+  "filings": [
+    {
+      "id": "KRA-EXEC-MW4PN3Y9",
+      "pin": "A012345678Z",
+      "year": "2025",
+      "ackNumber": "KRA202519633900",
+      "status": "simulated",
+      "createdAt": "2026-11-06T08:26:18.177Z",
+      "channel": "rpa-simulator"
+    }
+  ],
+  "requests": [
+    {
+      "reference": "EB-MW4PLLY6",
+      "serviceId": "dci-good-conduct",
+      "serviceName": "Police Clearance (Good Conduct)",
+      "applicant": "Otieno Odhiambo",
+      "phone": "+254798765432",
+      "notes": "Need certificate for job application",
+      "status": "submitted",
+      "createdAt": "2026-11-06T08:25:08.190Z",
+      "updatedAt": "2026-11-06T08:25:08.190Z",
+      "decisionNote": ""
+    },
+    {
+      "reference": "EB-MW4PAM7L",
+      "serviceId": "ntsa-licence",
+      "serviceName": "Driving Licence Renewal",
+      "applicant": "Wanjiku Kamau",
+      "phone": "+254712345678",
+      "notes": "Renewal due",
+      "status": "approved",
+      "createdAt": "2026-11-06T08:16:35.313Z",
+      "updatedAt": "2026-11-06T08:18:20.471Z",
+      "decisionNote": "Documents verified"
+    }
+  ],
+  "audit": [
+    {
+      "id": "AUD-mw4pn3yo-ku4r",
+      "at": "2026-11-06T08:26:18.192Z",
+      "actor": "citizen",
+      "action": "filing.simulated",
+      "target": "KRA-EXEC-MW4PN3Y9",
+      "detail": "PIN A01*****78Z, year 2025"
+    },
+    {
+      "id": "AUD-mw4plly9-bkip",
+      "at": "2026-11-06T08:25:08.193Z",
+      "actor": "citizen",
+      "action": "service.request",
+      "target": "EB-MW4PLLY6",
+      "detail": "Police Clearance (Good Conduct) for Otieno Odhiambo"
+    },
+    {
+      "id": "AUD-mw4pj2ev-v756",
+      "at": "2026-11-06T08:23:09.559Z",
+      "actor": "admin@ebureaucrat.local",
+      "action": "admin.login",
+      "target": "session",
+      "detail": "ip=127.0.0.1"
+    },
+    {
+      "id": "AUD-mw4pcvd1-fs3l",
+      "at": "2026-11-06T08:18:20.485Z",
+      "actor": "admin@ebureaucrat.local",
+      "action": "request.approved",
+      "target": "EB-MW4PAM7L",
+      "detail": "Documents verified"
+    },
+    {
+      "id": "AUD-mw4pbtks-vjpd",
+      "at": "2026-11-06T08:17:31.516Z",
+      "actor": "admin@ebureaucrat.local",
+      "action": "admin.login",
+      "target": "session",
+      "detail": "ip=127.0.0.1"
+    },
+    {
+      "id": "AUD-mw4pbt35-88rd",
+      "at": "2026-11-06T08:17:30.881Z",
+      "actor": "anonymous",
+      "action": "admin.login.failed",
+      "target": "admin@ebureaucrat.local",
+      "detail": "ip=127.0.0.1"
+    },
+    {
+      "id": "AUD-mw4pam7n-ah2a",
+      "at": "2026-11-06T08:16:35.315Z",
+      "actor": "citizen",
+      "action": "service.request",
+      "target": "EB-MW4PAM7L",
+      "detail": "Driving Licence Renewal for Wanjiku Kamau"
+    }
+  ]
+}

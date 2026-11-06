@@ -1,7 +1,9 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
@@ -12,8 +14,375 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+
+// Demo guard: keeps a public URL from draining the Gemini quota.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 40;
+const RATE_BUCKETS = new Map<string, { count: number; resetAt: number }>();
+
+app.use('/api', (req, res, next) => {
+  const now = Date.now();
+  const ip = req.ip ?? 'unknown';
+  const bucket = RATE_BUCKETS.get(ip);
+
+  if (!bucket || now > bucket.resetAt) {
+    RATE_BUCKETS.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+  } else if (++bucket.count > RATE_LIMIT_MAX) {
+    res.setHeader('Retry-After', Math.ceil((bucket.resetAt - now) / 1000));
+    return res.status(429).json({
+      success: false,
+      error: 'Demo rate limit reached. Please try again in a minute.',
+    });
+  }
+
+  if (RATE_BUCKETS.size > 5000) {
+    for (const [key, entry] of RATE_BUCKETS) {
+      if (now > entry.resetAt) RATE_BUCKETS.delete(key);
+    }
+  }
+
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// Durable demo store (JSON file). Render's free disk is ephemeral: data resets
+// on deploy, which is acceptable for a prototype but not for real filings.
+// ---------------------------------------------------------------------------
+type RequestStatus = 'submitted' | 'in_review' | 'approved' | 'rejected';
+
+interface FilingRecord {
+  id: string;
+  pin: string;
+  year: string;
+  ackNumber: string;
+  status: 'simulated';
+  createdAt: string;
+  channel: string;
+}
+
+interface ServiceRequestRecord {
+  reference: string;
+  serviceId: string;
+  serviceName: string;
+  applicant: string;
+  phone: string;
+  notes: string;
+  status: RequestStatus;
+  createdAt: string;
+  updatedAt: string;
+  decisionNote: string;
+}
+
+interface AuditEvent {
+  id: string;
+  at: string;
+  actor: string;
+  action: string;
+  target: string;
+  detail: string;
+}
+
+interface StoreShape {
+  filings: FilingRecord[];
+  requests: ServiceRequestRecord[];
+  audit: AuditEvent[];
+}
+
+const DATA_DIR = path.resolve(__dirname, 'data');
+const STORE_PATH = path.join(DATA_DIR, 'store.json');
+const STORE_LIMIT = 500;
+
+function loadStore(): StoreShape {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')) as Partial<StoreShape>;
+    return {
+      filings: Array.isArray(parsed.filings) ? parsed.filings : [],
+      requests: Array.isArray(parsed.requests) ? parsed.requests : [],
+      audit: Array.isArray(parsed.audit) ? parsed.audit : [],
+    };
+  } catch {
+    return { filings: [], requests: [], audit: [] };
+  }
+}
+
+const store = loadStore();
+
+function saveStore() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = `${STORE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
+    fs.renameSync(tmp, STORE_PATH);
+  } catch (err) {
+    console.error('Failed to persist store:', err);
+  }
+}
+
+function audit(actor: string, action: string, target: string, detail = '') {
+  store.audit.unshift({
+    id: `AUD-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    at: new Date().toISOString(),
+    actor,
+    action,
+    target,
+    detail,
+  });
+  if (store.audit.length > STORE_LIMIT) store.audit.length = STORE_LIMIT;
+  saveStore();
+}
+
+function maskIdentifier(value?: string | null) {
+  if (!value) return '—';
+  if (value.length <= 5) return '*'.repeat(value.length);
+  return `${value.slice(0, 3)}${'*'.repeat(value.length - 6)}${value.slice(-3)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Admin authentication: scrypt hash + HMAC-signed HttpOnly cookie.
+// No default password in production — login stays disabled until a hash is set.
+// ---------------------------------------------------------------------------
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@ebureaucrat.local').toLowerCase();
+const ADMIN_COOKIE = 'eb_admin';
+const ADMIN_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+const ADMIN_SESSION_SECRET =
+  process.env.ADMIN_SESSION_SECRET ||
+  process.env.ADMIN_PASSWORD_HASH ||
+  randomBytes(32).toString('hex');
+
+function hashPassword(password: string) {
+  const salt = randomBytes(16).toString('hex');
+  return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`;
+}
+
+let adminPasswordHash = process.env.ADMIN_PASSWORD_HASH || '';
+if (!adminPasswordHash && process.env.ADMIN_PASSWORD) {
+  adminPasswordHash = hashPassword(process.env.ADMIN_PASSWORD);
+}
+if (!adminPasswordHash && process.env.NODE_ENV !== 'production') {
+  adminPasswordHash = hashPassword('AdminDemo2026!');
+  console.warn('Admin login is using the local demo password. Set ADMIN_PASSWORD_HASH before deploying.');
+}
+if (!adminPasswordHash) {
+  console.warn('Admin login disabled: set ADMIN_PASSWORD_HASH to enable the console.');
+}
+
+function verifyAdminPassword(password: string) {
+  if (!adminPasswordHash) return false;
+  const [salt, expectedHex] = adminPasswordHash.split(':');
+  if (!salt || !expectedHex) return false;
+  const actual = scryptSync(password, salt, 64);
+  const expected = Buffer.from(expectedHex, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function signToken(payload: string) {
+  return createHmac('sha256', ADMIN_SESSION_SECRET).update(payload).digest('base64url');
+}
+
+function createAdminToken(email: string) {
+  const payload = Buffer.from(
+    JSON.stringify({ email, exp: Date.now() + ADMIN_SESSION_TTL_MS }),
+  ).toString('base64url');
+  return `${payload}.${signToken(payload)}`;
+}
+
+function readAdminSession(req: express.Request): { email: string; exp: number } | null {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  const raw = header
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${ADMIN_COOKIE}=`));
+  if (!raw) return null;
+
+  const token = raw.slice(ADMIN_COOKIE.length + 1);
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+
+  const given = Buffer.from(signature);
+  const expected = Buffer.from(signToken(payload));
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString()) as {
+      email?: string;
+      exp?: number;
+    };
+    if (!parsed.email || typeof parsed.exp !== 'number' || parsed.exp < Date.now()) return null;
+    return { email: parsed.email, exp: parsed.exp };
+  } catch {
+    return null;
+  }
+}
+
+const requireAdmin: express.RequestHandler = (req, res, next) => {
+  const session = readAdminSession(req);
+  if (!session) {
+    return res.status(401).json({ success: false, error: 'Admin login required' });
+  }
+  (req as express.Request & { adminEmail?: string }).adminEmail = session.email;
+  next();
+};
+
+const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Service catalog. "simulated" = end-to-end demo, "catalog" = intake only,
+// "not-offered" = deliberately out of scope (payments, government accounts).
+// ---------------------------------------------------------------------------
+type ServiceStatus = 'simulated' | 'catalog' | 'not-offered';
+
+interface ServiceDefinition {
+  id: string;
+  name: string;
+  agency: string;
+  category: string;
+  status: ServiceStatus;
+  description: string;
+  fee: string;
+  turnaround: string;
+  channels: string[];
+}
+
+const SERVICE_CATALOG: ServiceDefinition[] = [
+  {
+    id: 'kra-nil-return',
+    name: 'KRA Nil Return Filing',
+    agency: 'Kenya Revenue Authority',
+    category: 'Tax',
+    status: 'simulated',
+    description: 'Voice-driven Nil Return interview with a simulated filing and sample acknowledgment.',
+    fee: 'KES 0',
+    turnaround: 'Instant (simulated)',
+    channels: ['WhatsApp voice', 'Web console'],
+  },
+  {
+    id: 'kra-pin',
+    name: 'KRA PIN Registration & Retrieval',
+    agency: 'Kenya Revenue Authority',
+    category: 'Tax',
+    status: 'catalog',
+    description: 'Request intake only. The demo does not connect to iTax to create or retrieve PINs.',
+    fee: 'KES 0',
+    turnaround: 'Demo: 1 working day',
+    channels: ['Web console'],
+  },
+  {
+    id: 'ntsa-licence',
+    name: 'Driving Licence Renewal',
+    agency: 'NTSA (TIMS)',
+    category: 'Transport',
+    status: 'catalog',
+    description: 'Intake and status tracking. No TIMS integration; no licence is issued.',
+    fee: 'Per NTSA schedule',
+    turnaround: 'Demo: 3 working days',
+    channels: ['Web console'],
+  },
+  {
+    id: 'ntsa-transfer',
+    name: 'Vehicle Ownership Transfer',
+    agency: 'NTSA (TIMS)',
+    category: 'Transport',
+    status: 'catalog',
+    description: 'Intake and status tracking only.',
+    fee: 'Per NTSA schedule',
+    turnaround: 'Demo: 5 working days',
+    channels: ['Web console'],
+  },
+  {
+    id: 'brs-name-search',
+    name: 'Business Name Search & Registration',
+    agency: 'Business Registration Service',
+    category: 'Business',
+    status: 'catalog',
+    description: 'Intake and status tracking. No BRS integration and no certificate is issued.',
+    fee: 'Per BRS schedule',
+    turnaround: 'Demo: 2 working days',
+    channels: ['Web console'],
+  },
+  {
+    id: 'immigration-passport',
+    name: 'Passport Application',
+    agency: 'Immigration Services',
+    category: 'Travel',
+    status: 'catalog',
+    description: 'Intake only. Biometrics and identity checks are out of scope for this demo.',
+    fee: 'Per government schedule',
+    turnaround: 'Demo: not scheduled',
+    channels: ['Web console'],
+  },
+  {
+    id: 'civil-birth',
+    name: 'Birth Certificate Application',
+    agency: 'Civil Registration Services',
+    category: 'Identity',
+    status: 'catalog',
+    description: 'Intake only. No civil registry access.',
+    fee: 'Per government schedule',
+    turnaround: 'Demo: not scheduled',
+    channels: ['Web console'],
+  },
+  {
+    id: 'helb-loan',
+    name: 'HELB Loan Application',
+    agency: 'Higher Education Loans Board',
+    category: 'Education',
+    status: 'catalog',
+    description: 'Intake only. No HELB integration.',
+    fee: 'KES 0',
+    turnaround: 'Demo: not scheduled',
+    channels: ['Web console'],
+  },
+  {
+    id: 'sha-registration',
+    name: 'SHA / NHIF Registration',
+    agency: 'Social Health Authority',
+    category: 'Health',
+    status: 'catalog',
+    description: 'Intake only. No health authority integration.',
+    fee: 'KES 0',
+    turnaround: 'Demo: not scheduled',
+    channels: ['Web console'],
+  },
+  {
+    id: 'dci-good-conduct',
+    name: 'Police Clearance (Good Conduct)',
+    agency: 'Directorate of Criminal Investigations',
+    category: 'Justice',
+    status: 'catalog',
+    description: 'Intake only. Fingerprints and certificate issuance are out of scope.',
+    fee: 'Per DCI schedule',
+    turnaround: 'Demo: not scheduled',
+    channels: ['Web console'],
+  },
+  {
+    id: 'ecitizen-payments',
+    name: 'Government Payments (eCitizen Paybill)',
+    agency: 'eCitizen',
+    category: 'Payments',
+    status: 'not-offered',
+    description: 'The demo collects no money and holds no payment credentials.',
+    fee: '—',
+    turnaround: '—',
+    channels: [],
+  },
+  {
+    id: 'ecitizen-account',
+    name: 'eCitizen Account & Profile',
+    agency: 'eCitizen',
+    category: 'Account',
+    status: 'not-offered',
+    description: 'Keep using your own eCitizen account. This demo does not create or store government accounts.',
+    fee: '—',
+    turnaround: '—',
+    channels: [],
+  },
+];
 
 // Server-side Gemini client with 'aistudio-build' telemetry header
 let aiClient: GoogleGenAI | null = null;
@@ -68,10 +437,18 @@ function fallbackDialogueEngine(userText: string, currentData: SessionRecord['da
     data.year = '2025';
   }
 
-  // Detect password mentions (e.g. "password yangu ni ...", "pass: ...", or single word alphanumeric with symbols)
-  const passMatch = userText.match(/(?:password|nenosiri|pass)\s*(?:yangu|ni|is|:)?\s*([A-Za-z0-9@#$%^&*!]{6,})/i);
+  // Detect password mentions (e.g. "password yangu ni ...", "pass: ...", or a bare secret)
+  const passMatch = userText.match(/(?:password|nenosiri|pass)\s*(?:(?:yangu|ni|is|ndio|:)\s*)*([A-Za-z0-9@#$%^&*!]{6,})/i);
   if (passMatch) {
     data.itax_password = passMatch[1].trim();
+  }
+  if (
+    !data.itax_password &&
+    data.kra_pin &&
+    /^[A-Za-z0-9@#$%^&*!]{6,}$/.test(userText.trim()) &&
+    !/^[AP]\d{9}[A-Z]$/i.test(userText.trim())
+  ) {
+    data.itax_password = userText.trim();
   }
 
   // Check 6-digit OTP
@@ -219,13 +596,21 @@ Rules:
       session.status = 'COLLECTING';
     }
 
+    const secret = session.data.itax_password;
+    const safeHistory = secret
+      ? session.history.map((item) => ({
+          ...item,
+          content: item.content.split(secret).join('••••••••'),
+        }))
+      : session.history;
+
     return res.json({
       success: true,
       reply,
       isComplete,
-      collectedData: session.data,
+      collectedData: { ...session.data, itax_password: secret ? '••••••••' : null },
       status: session.status,
-      history: session.history,
+      history: safeHistory,
     });
   } catch (error) {
     console.error('Error in /api/dialogue:', error);
@@ -330,6 +715,18 @@ app.post('/api/rpa/execute-kra', async (req, res) => {
       qrVerificationUrl: `https://itax.kra.go.ke/KRA-Portal/verifyReturn.htm?ack=${ackNumber}`,
     };
 
+    store.filings.unshift({
+      id: executionId,
+      pin: kra_pin,
+      year,
+      ackNumber,
+      status: 'simulated',
+      createdAt: timestamp,
+      channel: 'rpa-simulator',
+    });
+    if (store.filings.length > STORE_LIMIT) store.filings.length = STORE_LIMIT;
+    audit('citizen', 'filing.simulated', executionId, `PIN ${maskIdentifier(kra_pin)}, year ${year}`);
+
     return res.json({
       success: true,
       executionId,
@@ -379,6 +776,292 @@ app.get('/api/health', (req, res) => {
     activeSessions: SESSIONS.size,
     timestamp: new Date().toISOString(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// Public service directory + request intake
+// ---------------------------------------------------------------------------
+function publicRequest(record: ServiceRequestRecord) {
+  return {
+    reference: record.reference,
+    serviceId: record.serviceId,
+    serviceName: record.serviceName,
+    applicant: record.applicant,
+    status: record.status,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    decisionNote: record.decisionNote,
+  };
+}
+
+// Public parity map against eCitizen's advertised capabilities (demo copy, 2026).
+const ECITIZEN_PARITY = [
+  {
+    capability: 'Single citizen account',
+    ecitizen: 'One account across all agencies',
+    demo: 'Not offered',
+    note: 'Citizens use the agent without an account; only staff sign in.',
+  },
+  {
+    capability: 'Service catalogue',
+    ecitizen: 'Hundreds of services',
+    demo: '12 modelled',
+    note: 'Representative services across tax, transport, business, travel, identity, health.',
+  },
+  {
+    capability: 'Application intake',
+    ecitizen: 'Online forms per service',
+    demo: 'Yes',
+    note: 'Requests are stored and queued for an officer decision.',
+  },
+  {
+    capability: 'Payments',
+    ecitizen: 'Paybill, cards, mobile money',
+    demo: 'Not offered',
+    note: 'No money moves and no payment credentials are accepted.',
+  },
+  {
+    capability: 'Document upload',
+    ecitizen: 'Attachments per application',
+    demo: 'Not offered',
+    note: 'Intake records text only; no files are stored.',
+  },
+  {
+    capability: 'Status tracking',
+    ecitizen: 'Dashboard, SMS, email',
+    demo: 'Yes',
+    note: 'Reference number lookup; notifications are not sent.',
+  },
+  {
+    capability: 'Appointments',
+    ecitizen: 'Booking for in-person visits',
+    demo: 'Not offered',
+    note: 'Out of scope for this prototype.',
+  },
+  {
+    capability: 'Voice and chat channel',
+    ecitizen: 'Web, USSD, limited WhatsApp',
+    demo: 'Core focus',
+    note: 'Swahili, Sheng and English with slot extraction.',
+  },
+  {
+    capability: 'Automated agency form filling',
+    ecitizen: 'Not offered',
+    demo: 'Simulated',
+    note: 'RPA screens are a simulation; no portal is opened.',
+  },
+  {
+    capability: 'Back-office review console',
+    ecitizen: 'Internal only',
+    demo: 'Yes',
+    note: 'Queue, decisions and audit trail behind admin login.',
+  },
+];
+
+app.get('/api/services', (_req, res) => {
+  return res.json({
+    success: true,
+    services: SERVICE_CATALOG,
+    parity: ECITIZEN_PARITY,
+    stats: { filings: store.filings.length, requests: store.requests.length },
+    disclaimer:
+      'Demo catalogue modelled on Kenyan eCitizen categories. Not affiliated with eCitizen or any government agency, and no request reaches an agency.',
+  });
+});
+
+app.post('/api/services/request', (req, res) => {
+  const body = req.body ?? {};
+  const service = SERVICE_CATALOG.find((item) => item.id === body.serviceId);
+
+  if (!service) return res.status(400).json({ success: false, error: 'Unknown service' });
+  if (service.status === 'not-offered') {
+    return res.status(400).json({ success: false, error: 'This service is not offered in the demo' });
+  }
+
+  const applicant = String(body.fullName ?? '').trim();
+  const phone = String(body.phone ?? '').trim();
+  const notes = String(body.notes ?? '').trim();
+
+  if (applicant.length < 2 || applicant.length > 80) {
+    return res.status(400).json({ success: false, error: 'Enter your full name (2-80 characters)' });
+  }
+  if (!/^\+?[0-9][0-9 ]{8,14}$/.test(phone)) {
+    return res.status(400).json({ success: false, error: 'Enter a valid phone number' });
+  }
+  if (notes.length > 300) {
+    return res.status(400).json({ success: false, error: 'Notes must be 300 characters or fewer' });
+  }
+
+  const now = new Date().toISOString();
+  const record: ServiceRequestRecord = {
+    reference: `EB-${Date.now().toString(36).toUpperCase()}`,
+    serviceId: service.id,
+    serviceName: service.name,
+    applicant,
+    phone,
+    notes,
+    status: 'submitted',
+    createdAt: now,
+    updatedAt: now,
+    decisionNote: '',
+  };
+
+  store.requests.unshift(record);
+  if (store.requests.length > STORE_LIMIT) store.requests.length = STORE_LIMIT;
+  saveStore();
+  audit('citizen', 'service.request', record.reference, `${service.name} for ${applicant}`);
+
+  return res.status(201).json({ success: true, request: publicRequest(record) });
+});
+
+app.get('/api/services/track/:reference', (req, res) => {
+  const record = store.requests.find(
+    (item) => item.reference === req.params.reference.toUpperCase(),
+  );
+  if (!record) return res.status(404).json({ success: false, error: 'Reference not found' });
+  return res.json({ success: true, request: publicRequest(record) });
+});
+
+// ---------------------------------------------------------------------------
+// Admin console API
+// ---------------------------------------------------------------------------
+app.get('/api/admin/session', (req, res) => {
+  const session = readAdminSession(req);
+  return res.json({
+    success: true,
+    authenticated: Boolean(session),
+    email: session?.email ?? null,
+    loginDisabled: !adminPasswordHash,
+  });
+});
+
+app.post('/api/admin/login', (req, res) => {
+  if (!adminPasswordHash) {
+    return res.status(503).json({
+      success: false,
+      error: 'Admin login is disabled. Set ADMIN_PASSWORD_HASH on the server.',
+    });
+  }
+
+  const ip = req.ip ?? 'unknown';
+  const now = Date.now();
+  const attempt = LOGIN_ATTEMPTS.get(ip);
+  if (attempt && now < attempt.resetAt && attempt.count >= LOGIN_MAX_ATTEMPTS) {
+    return res.status(429).json({
+      success: false,
+      error: 'Too many attempts. Try again in 15 minutes.',
+    });
+  }
+
+  const email = String(req.body?.email ?? '').trim().toLowerCase();
+  const password = String(req.body?.password ?? '');
+  const valid = email === ADMIN_EMAIL && verifyAdminPassword(password);
+
+  if (!valid) {
+    if (!attempt || now > attempt.resetAt) {
+      LOGIN_ATTEMPTS.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    } else {
+      attempt.count += 1;
+    }
+    audit('anonymous', 'admin.login.failed', email || 'unknown', `ip=${ip}`);
+    return res.status(401).json({ success: false, error: 'Invalid email or password' });
+  }
+
+  LOGIN_ATTEMPTS.delete(ip);
+  const cookie = [
+    `${ADMIN_COOKIE}=${createAdminToken(email)}`,
+    'HttpOnly',
+    'Path=/',
+    'SameSite=Strict',
+    `Max-Age=${Math.floor(ADMIN_SESSION_TTL_MS / 1000)}`,
+    process.env.NODE_ENV === 'production' ? 'Secure' : '',
+  ]
+    .filter(Boolean)
+    .join('; ');
+
+  res.setHeader('Set-Cookie', cookie);
+  audit(email, 'admin.login', 'session', `ip=${ip}`);
+  return res.json({ success: true, email });
+});
+
+app.post('/api/admin/logout', (_req, res) => {
+  res.setHeader('Set-Cookie', `${ADMIN_COOKIE}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0`);
+  return res.json({ success: true });
+});
+
+app.get('/api/admin/overview', requireAdmin, (_req, res) => {
+  const requestsByStatus: Record<string, number> = {
+    submitted: 0,
+    in_review: 0,
+    approved: 0,
+    rejected: 0,
+  };
+  for (const item of store.requests) {
+    requestsByStatus[item.status] = (requestsByStatus[item.status] ?? 0) + 1;
+  }
+
+  return res.json({
+    success: true,
+    overview: {
+      sessions: SESSIONS.size,
+      filings: store.filings.length,
+      requests: store.requests.length,
+      requestsByStatus,
+      auditEvents: store.audit.length,
+      geminiActive: Boolean(aiClient),
+      uptimeSeconds: Math.round(process.uptime()),
+      node: process.version,
+      storage: 'json-file',
+      adminEmail: ADMIN_EMAIL,
+    },
+  });
+});
+
+app.get('/api/admin/filings', requireAdmin, (_req, res) => {
+  return res.json({
+    success: true,
+    filings: store.filings.map((filing) => ({ ...filing, pin: maskIdentifier(filing.pin) })),
+  });
+});
+
+app.get('/api/admin/requests', requireAdmin, (_req, res) => {
+  return res.json({
+    success: true,
+    requests: store.requests.map((record) => ({
+      ...publicRequest(record),
+      phone: maskIdentifier(record.phone),
+    })),
+  });
+});
+
+app.patch('/api/admin/requests/:reference', requireAdmin, (req, res) => {
+  const allowed: RequestStatus[] = ['in_review', 'approved', 'rejected'];
+  const status = String(req.body?.status ?? '') as RequestStatus;
+  if (!allowed.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Status must be in_review, approved or rejected',
+    });
+  }
+
+  const record = store.requests.find(
+    (item) => item.reference === req.params.reference.toUpperCase(),
+  );
+  if (!record) return res.status(404).json({ success: false, error: 'Reference not found' });
+
+  record.status = status;
+  record.decisionNote = String(req.body?.note ?? '').slice(0, 300);
+  record.updatedAt = new Date().toISOString();
+  saveStore();
+
+  const actor = (req as express.Request & { adminEmail?: string }).adminEmail ?? 'admin';
+  audit(actor, `request.${status}`, record.reference, record.decisionNote);
+
+  return res.json({ success: true, request: record });
+});
+
+app.get('/api/admin/audit', requireAdmin, (_req, res) => {
+  return res.json({ success: true, events: store.audit.slice(0, 100) });
 });
 
 // Start dev server with Vite middlewares
